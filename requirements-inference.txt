@@ -1,0 +1,5 @@
+openenv-core>=0.2.3
+openai>=2.7.2
+pydantic>=2.0.0
+websockets>=15.0.1
+python-dotenv>=1.0.0
