@@ -192,7 +192,7 @@ uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
 | `API_BASE_URL` | Yes | — | OpenAI-compatible LLM endpoint |
 | `MODEL_NAME` | Yes | — | Model identifier |
 | `HF_TOKEN` | Yes | — | API key for the LLM endpoint |
-| `OPENENV_URL` | No | `http://localhost:8000` | Running OpenEnv server URL |
+| `OPENENV_URL` | Yes | — | Running OpenEnv server URL (e.g. `https://blitz1809-sre-defender-env.hf.space`) |
 
 ---
 
