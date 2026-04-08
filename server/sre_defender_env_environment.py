@@ -20,11 +20,50 @@ from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
+from openenv.core.rubrics.base import Rubric as _Rubric
 
 try:
     from ..models import SreDefenderAction, SreDefenderObservation
 except ImportError:
     from models import SreDefenderAction, SreDefenderObservation
+
+
+# ---------------------------------------------------------------------------
+# Rubric (graders) — required by OpenEnv spec; one named child per task
+# ---------------------------------------------------------------------------
+
+class _TaskRubric(_Rubric):
+    """Per-task rubric that delegates to the environment's scoring function."""
+
+    def __init__(self, env_ref: "SreDefenderEnvEnvironment", task_id: int) -> None:
+        super().__init__()
+        self._env = env_ref
+        self._task_id = task_id
+
+    def forward(self, action: object, observation: object) -> float:  # type: ignore[override]
+        if self._env._task_id == self._task_id:
+            return self._env._compute_score()
+        return 0.01  # this task is not currently active
+
+
+class SreDefenderRubric(_Rubric):
+    """Composite rubric exposing all 3 task graders as named children.
+
+    The Phase 2 validator calls env.rubric.named_rubrics() to enumerate
+    per-task graders. Each named child corresponds to one hackathon task.
+    """
+
+    def __init__(self, env_ref: "SreDefenderEnvEnvironment") -> None:
+        super().__init__()
+        self._env = env_ref
+        # Assigning Rubric instances as attributes auto-registers them as
+        # children via Rubric.__setattr__.
+        self.block_single_ip = _TaskRubric(env_ref, task_id=1)
+        self.rate_limiter = _TaskRubric(env_ref, task_id=2)
+        self.payload_defender = _TaskRubric(env_ref, task_id=3)
+
+    def forward(self, action: object, observation: object) -> float:  # type: ignore[override]
+        return self._env._compute_score()
 
 
 # ---------------------------------------------------------------------------
@@ -158,11 +197,15 @@ class SreDefenderEnvEnvironment(Environment):
     SUPPORTS_CONCURRENT_SESSIONS: bool = False
 
     def __init__(self) -> None:
+        super().__init__()  # sets self.transform = None, self.rubric = None
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._task_id: int = 1
         self._log_offset: int = 0
         self._traffic_thread: threading.Thread | None = None
         self._stop_event: threading.Event = threading.Event()
+        # Attach composite rubric — 3 named children satisfy the
+        # "minimum 3 tasks with graders" hackathon requirement.
+        self.rubric = SreDefenderRubric(self)
 
     # ------------------------------------------------------------------
     # Public API
@@ -177,6 +220,7 @@ class SreDefenderEnvEnvironment(Environment):
 
         self._task_id = task_id
         self._state = State(episode_id=str(uuid4()), step_count=0)
+        self._reset_rubric()  # clear rubric trajectory state between episodes
 
         # Wipe agent nginx rules
         try:
@@ -232,10 +276,10 @@ class SreDefenderEnvEnvironment(Environment):
         )
 
     def step(self, action: SreDefenderAction) -> SreDefenderObservation:  # type: ignore[override]
-        """Dispatch action, compute score lazily from nginx log."""
+        """Dispatch action, score via rubric (reads nginx log)."""
         self._state.step_count += 1
         obs = self._dispatch(action)
-        score = self._compute_score()
+        score = self._apply_rubric(action, obs)  # delegates to SreDefenderRubric.forward()
         obs.current_score = score
         obs.reward = score
         return obs
@@ -388,13 +432,13 @@ class SreDefenderEnvEnvironment(Environment):
     def _compute_score(self) -> float:
         log_path = Path(_ACCESS_LOG)
         if not log_path.exists():
-            return 0.0
+            return 0.01  # no log yet — floor keeps score in valid (0, 1) range
         try:
             with open(_ACCESS_LOG, "rb") as fh:
                 fh.seek(self._log_offset)
                 data = fh.read().decode("utf-8", errors="replace")
         except Exception:
-            return 0.0
+            return 0.01
 
         total_malicious = malicious_blocked = 0
         total_legit = legit_allowed = 0
@@ -442,14 +486,16 @@ class SreDefenderEnvEnvironment(Environment):
                         legit_allowed += 1
 
         if total_malicious == 0 or total_legit == 0:
-            return 0.0  # no traffic yet
+            return 0.01  # no traffic yet — floor keeps score in valid (0, 1) range
         if legit_allowed == 0:
-            return 0.0  # anti-exploit: agent blocked all legit traffic
+            return 0.01  # anti-exploit: agent blocked all legit traffic
         # Laplace smoothing on the malicious side only (+1 pseudocount).
         # Keeps score > 0 once traffic is flowing (prevents cold-start 0.0),
         # while preserving the anti-exploit property via the explicit check above.
         raw = ((malicious_blocked + 1) / (total_malicious + 1)) * (legit_allowed / total_legit)
-        return min(raw, 0.999)
+        # Clamp to [0.01, 0.99]: 0.999 formatted as {:.2f} becomes "1.00"
+        # which fails the hackathon "strictly < 1.0" validator check.
+        return max(0.01, min(raw, 0.99))
 
     # ------------------------------------------------------------------
     # Helpers

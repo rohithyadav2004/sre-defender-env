@@ -12,12 +12,15 @@ Environment variables (all required):
     API_BASE_URL   OpenAI-compatible LLM API endpoint
     MODEL_NAME     Model identifier (e.g. "Qwen/Qwen2.5-72B-Instruct")
     HF_TOKEN       API key for the LLM endpoint
-    OPENENV_URL    Base URL of the running OpenEnv server (e.g. http://localhost:8000)
+    OPENENV_URL    Base URL of the running OpenEnv server (default: http://localhost:8000)
 
 Stdout format (exact — judges parse these):
-    [START] {"model": "...", "env": "sre_defender_env", "tasks": [1,2,3]}
-    [STEP]  {"task": N, "step": N, "action_type": "...", "score": 0.0}
-    [END]   {"task_scores": [0.0, 0.0, 0.0], "mean_score": 0.0}
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_type> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<0.00> rewards=<r1,r2,...>
+
+Three [START]…[END] blocks are emitted — one per task — satisfying the
+"minimum 3 tasks with graders" requirement.
 
 Must complete in < 20 minutes total.
 """
@@ -52,6 +55,15 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://api-inference.huggingface.co/v
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN = os.environ["HF_TOKEN"]
 OPENENV_URL = os.environ.get("OPENENV_URL", "http://localhost:8000").rstrip("/")
+
+BENCHMARK = "sre_defender_env"
+SUCCESS_THRESHOLD = 0.5
+
+TASK_NAMES = {
+    1: "block_single_ip",
+    2: "rate_limiter",
+    3: "payload_defender",
+}
 
 llm = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
@@ -125,7 +137,7 @@ def _build_user_message(obs, task_id: int, step: int) -> str:
     server_status = getattr(obs, "server_status", "unknown")
     error_message = getattr(obs, "error_message", "") or "(none)"
     log_tail = getattr(obs, "log_tail", "") or "(empty)"
-    # Trim to 40 lines to stay within Groq's 8000-token-per-request limit
+    # Trim to 40 lines to stay within token limits
     lines = log_tail.splitlines()
     if len(lines) > 40:
         log_tail = "\n".join(lines[-40:])
@@ -143,7 +155,15 @@ def _build_user_message(obs, task_id: int, step: int) -> str:
 # ---------------------------------------------------------------------------
 
 def run_task(task_id: int, max_steps: int = 10) -> tuple[float, list[float]]:
-    """Run one task via WebSocket. Returns (final_score, per_step_rewards)."""
+    """Run one task via WebSocket. Emits [START], [STEP]s, [END] per spec.
+
+    Returns (final_score, per_step_rewards).
+    """
+    task_name = TASK_NAMES[task_id]
+
+    # One [START] line per task — required format
+    print(f"[START] task={task_name} env={BENCHMARK} model={MODEL_NAME}", flush=True)
+
     # IMPORTANT: Use WebSocket client — NOT raw HTTP.
     # Raw HTTP /reset and /step create a fresh env per-request and immediately
     # call close(), so the traffic state is lost. WebSocket keeps one persistent
@@ -151,19 +171,17 @@ def run_task(task_id: int, max_steps: int = 10) -> tuple[float, list[float]]:
     env_client = SreDefenderEnv(base_url=OPENENV_URL)
     sync_env = env_client.sync()
 
+    last_score = 0.0
+    step_rewards: list[float] = []
+    # Sliding-window context: keep only the most recent exchange
+    prev_exchange: tuple[str, str] | None = None
+
     with sync_env:
         result = sync_env.reset(task_id=task_id)
         obs = result.observation
 
-        # Give the traffic generator a moment to produce log data
+        # Give the traffic generator time to produce log data
         time.sleep(3)
-
-        last_score = 0.0
-        step_rewards: list[float] = []
-        # Sliding-window context: keep only the most recent exchange so the
-        # conversation never exceeds ~4 messages (system + prev_user +
-        # prev_assistant + current_user), staying well within Groq's 8k TPM limit.
-        prev_exchange: tuple[str, str] | None = None  # (user_msg, assistant_raw)
 
         for step in range(1, max_steps + 1):
             user_msg = _build_user_message(obs, task_id, step)
@@ -186,7 +204,7 @@ def run_task(task_id: int, max_steps: int = 10) -> tuple[float, list[float]]:
                 raw = completion.choices[0].message.content.strip()
 
                 if not raw:
-                    raise ValueError("LLM returned empty response")
+                    raise ValueError("empty_response")
 
                 # Strip markdown code fences if present
                 if raw.startswith("```"):
@@ -202,8 +220,11 @@ def run_task(task_id: int, max_steps: int = 10) -> tuple[float, list[float]]:
                 prev_exchange = (user_msg, raw)
 
             except Exception as exc:
+                err = str(exc).replace("\n", "_").replace(" ", "_")[:80]
+                step_rewards.append(last_score)
                 print(
-                    f"[STEP] {json.dumps({'task': task_id, 'step': step, 'action_type': 'llm_error', 'score': last_score, 'error': str(exc)})}",
+                    f"[STEP] step={step} action=llm_error"
+                    f" reward={last_score:.2f} done=false error={err}",
                     flush=True,
                 )
                 time.sleep(1)
@@ -213,8 +234,11 @@ def run_task(task_id: int, max_steps: int = 10) -> tuple[float, list[float]]:
             try:
                 result = sync_env.step(action)
             except Exception as exc:
+                err = str(exc).replace("\n", "_").replace(" ", "_")[:80]
+                step_rewards.append(last_score)
                 print(
-                    f"[STEP] {json.dumps({'task': task_id, 'step': step, 'action_type': action.action_type, 'score': last_score, 'error': str(exc)})}",
+                    f"[STEP] step={step} action={action.action_type}"
+                    f" reward={last_score:.2f} done=false error={err}",
                     flush=True,
                 )
                 time.sleep(1)
@@ -226,7 +250,8 @@ def run_task(task_id: int, max_steps: int = 10) -> tuple[float, list[float]]:
             step_rewards.append(last_score)
 
             print(
-                f"[STEP] {json.dumps({'task': task_id, 'step': step, 'action_type': action.action_type, 'reward': last_score, 'score': last_score, 'done': done})}",
+                f"[STEP] step={step} action={action.action_type}"
+                f" reward={last_score:.2f} done={str(done).lower()} error=null",
                 flush=True,
             )
 
@@ -235,33 +260,32 @@ def run_task(task_id: int, max_steps: int = 10) -> tuple[float, list[float]]:
 
             time.sleep(1)  # let traffic accumulate between steps
 
-    return last_score, step_rewards
+    # Ensure final score is strictly in (0, 1) even if all steps failed
+    final_score = max(last_score, 0.01)
+    success = final_score >= SUCCESS_THRESHOLD
+    rewards_str = (
+        ",".join(f"{r:.2f}" for r in step_rewards)
+        if step_rewards
+        else f"{final_score:.2f}"
+    )
+
+    # One [END] line per task — required format
+    print(
+        f"[END] success={str(success).lower()} steps={len(step_rewards)}"
+        f" score={final_score:.2f} rewards={rewards_str}",
+        flush=True,
+    )
+
+    return final_score, step_rewards
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — runs all 3 tasks, each with its own [START]…[END] block
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print(
-        f"[START] {json.dumps({'model': MODEL_NAME, 'env': 'sre_defender_env', 'tasks': [1, 2, 3]})}",
-        flush=True,
-    )
-
-    task_scores: list[float] = []
-    all_rewards: list[float] = []
-
     for task_id in [1, 2, 3]:
-        score, rewards = run_task(task_id)
-        task_scores.append(round(score, 4))
-        all_rewards.extend(rewards)
-
-    mean_score = round(sum(task_scores) / len(task_scores), 4)
-    success = mean_score >= 0.5
-    print(
-        f"[END] {json.dumps({'success': success, 'task_scores': task_scores, 'mean_score': mean_score, 'score': mean_score, 'rewards': all_rewards})}",
-        flush=True,
-    )
+        run_task(task_id)
 
 
 if __name__ == "__main__":
