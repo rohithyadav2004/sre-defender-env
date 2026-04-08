@@ -442,8 +442,14 @@ class SreDefenderEnvEnvironment(Environment):
                         legit_allowed += 1
 
         if total_malicious == 0 or total_legit == 0:
-            return 0.0
-        return (malicious_blocked / total_malicious) * (legit_allowed / total_legit)
+            return 0.0  # no traffic yet
+        if legit_allowed == 0:
+            return 0.0  # anti-exploit: agent blocked all legit traffic
+        # Laplace smoothing on the malicious side only (+1 pseudocount).
+        # Keeps score > 0 once traffic is flowing (prevents cold-start 0.0),
+        # while preserving the anti-exploit property via the explicit check above.
+        raw = ((malicious_blocked + 1) / (total_malicious + 1)) * (legit_allowed / total_legit)
+        return min(raw, 0.999)
 
     # ------------------------------------------------------------------
     # Helpers
